@@ -1,0 +1,579 @@
+/*
+	Инструкция для AI
+*/
+
+
+на STM32 подключаю OLED1306, на порте DC нет логического уровня сигнала
+
+Схема подключения:
+PA5  → SCK  (такт SPI)     ← SPI1
+PA6  → MISO (не используется для OLED)
+PA7  → MOSI (данные SPI)   ← SPI1  
+PA9  → CS   (Chip Select)  ← GPIO Output
+PA10 → DC   (Data/Command) ← GPIO Output
+
+OLED1306	GND	VDD	SCK	SDA	RES	DC	 CS
+STM32		G	3.3	PA5 PA7 PA8	PA10 PA9 	
+
+#include "main.h"
+#include "ssd1306.h"
+#include "sync.h"
+
+int main(void) {
+
+    RccClockInit(); // Включение тактирования
+    sleep(5000);
+    SPI1Init();     // Инициализация шины SPI1
+    sleep(5000);
+    ssd1306Init();  // Инициализация устройства OLED1306 на шине SPI
+    sleep(5000);
+    
+    // Настройка прерываний DMA
+    DMA1_Channel3->CCR |= DMA_CCR3_TCIE; 
+    NVIC_EnableIRQ(DMA1_Channel3_IRQn);
+    __enable_irq();
+    sleep(5000);
+    
+    while (1) {
+        // 1. Спираль появляется (белая нить)
+        ssd1306SpiralStep(WHITE, 1000); 
+        // Пауза, когда экран полностью заполнен
+        sleep(5000); 
+        // 2. Спираль исчезает (черная нить стирает белую)
+        // Важно: если идти по тому же алгоритму, она будет исчез#include "ssd1306.h"
+#include "sync.h"     // sleep(uint8_t iterations); // 577067 = 1 c
+
+static uint8_t displayBuff[BUFFER_SIZE];                       // Буфер экрана
+
+
+void SPI1Init()
+{
+    // 1. Включаем тактирование (добавили AFIO для стабильности альтернативных функций)
+    RCC->APB2ENR |= RCC_APB2ENR_SPI1EN | RCC_APB2ENR_IOPAEN | RCC_APB2ENR_AFIOEN;
+    RCC->AHBENR  |= RCC_AHBENR_DMA1EN;
+    
+    // 2. PA5-SCK, PA7-MOSI (Альтернативная функция Push-Pull)
+    // Очищаем MODE и CNF для пинов 5 и 7, затем ставим 1011 (AF Output PP, 50MHz)
+    GPIOA->CRL &= ~(GPIO_CRL_CNF5 | GPIO_CRL_MODE5 | GPIO_CRL_CNF7 | GPIO_CRL_MODE7);
+    GPIOA->CRL |= (GPIO_CRL_MODE5 | GPIO_CRL_CNF5_1); // AF PP 50MHz для SCK
+    GPIOA->CRL |= (GPIO_CRL_MODE7 | GPIO_CRL_CNF7_1); // AF PP 50MHz для MOSI
+    
+    // 3. PA8 (RES), PA9 (CS), PA10 (DC) (Обычный выход Push-Pull)
+    // Очищаем MODE и CNF, ставим 0011 (General Purpose Output PP, 50MHz)
+    GPIOA->CRH &= ~(GPIO_CRH_CNF8 | GPIO_CRH_MODE8 | 
+                    GPIO_CRH_CNF9 | GPIO_CRH_MODE9 | 
+                    GPIO_CRH_CNF10 | GPIO_CRH_MODE10);
+    GPIOA->CRH |= (GPIO_CRH_MODE8 | GPIO_CRH_MODE9 | GPIO_CRH_MODE10);
+    
+    // Сразу выставляем CS в 1, чтобы дисплей не начал принимать мусор при старте
+    GPIOA->BSRR = GPIO_BSRR_BS9; 
+
+    // 4. Настройка SPI1
+    SPI1->CR1 = 0; // Сброс регистра для чистой настройки
+    SPI1->CR1 |= (SPI_CR1_MSTR | SPI_CR1_SSI | SPI_CR1_SSM); 
+    
+    // Замедляем скорость до максимума (BR = 111) для теста. Если заработает - уменьшим.
+    // Частота будет: 72МГц / 256 = ~280кГц. Это гарантированно прочитает любой дисплей.
+    SPI1->CR1 |= (SPI_CR1_BR_2 | SPI_CR1_BR_1 | SPI_CR1_BR_0); 
+    
+    SPI1->CR2 |= SPI_CR2_TXDMAEN; 
+    SPI1->CR1 |= SPI_CR1_SPE; // Включаем SPI
+    sleep(5000);
+    
+    // 5. Настройка DMA1 Канал 3
+    DMA1_Channel3->CCR = 0; // Полный сброс настроек канала
+    DMA1_Channel3->CCR |= (DMA_CCR3_DIR |    // Направление: из памяти в периферию
+                           DMA_CCR3_MINC |   // Инкремент адреса памяти включен
+                           DMA_CCR3_PL_1 |   // Приоритет: Высокий (High)
+                           DMA_CCR3_TCIE);   // Прерывание по завершению передачи
+
+}
+
+void SPI1Transmit(uint8_t data)
+{
+    // Ждем, пока буфер передачи станет пустым
+    while(!(SPI1->SR & SPI_SR_TXE)); 
+    // Отправляем данные
+    SPI1->DR = data;
+    // Ждем, пока последний бит физически покинет ножку MOSI
+    while((SPI1->SR & SPI_SR_BSY));
+}
+
+
+void ssd1306RunDisplayUPD()
+{
+    DMA1_Channel3->CCR &= ~(DMA_CCR1_EN);         // Выключить DMA
+    DMA1_Channel3->CPAR = (uint32_t)(&SPI1->DR);  // Занесем в DMA адрес регистра данных SPI1
+    DMA1_Channel3->CMAR = (uint32_t)&displayBuff; // Адрес данных
+    DMA1_Channel3->CNDTR = sizeof(displayBuff);   // Размер данных
+    DMA1->IFCR &= ~(DMA_IFCR_CGIF3);
+    CS_RES;                                       // Выбор устройства на шине
+    DMA1_Channel3->CCR |= DMA_CCR1_CIRC;          // Циклический режим DMA
+    DMA1_Channel3->CCR |= DMA_CCR1_EN;            // Включить DMA
+}
+
+void ssd1306StopDispayUPD()
+{
+    CS_SET;                                       // Дезактивация устройства на шине
+    DMA1_Channel3->CCR &= ~(DMA_CCR1_EN);         // Выключить DMA
+    DMA1_Channel3->CCR &= ~DMA_CCR1_CIRC;         // Выключить циклический режим
+}
+
+void ssd1306SendCommand(uint8_t command) {
+    COMMAND;          // DC в 0
+    CS_RES;           // Выбрать чип
+    SPI1Transmit(command);
+    CS_SET;           // Отпустить чип
+}
+
+void ssd1306Init()
+{
+    uint16_t i;
+ 
+    // 1. Настройку GPIOA->CRL и GPIOA->CRH здесь не производим, 
+    // так как она уже сделана в SPI1Init() для пинов 8, 9, 10.
+
+    // 2. Очистка буфера в памяти МК
+    for(i = 0; i < BUFFER_SIZE; i++)
+    {
+        displayBuff[i] = 0;
+    }
+
+    // 3. Аппаратный сброс
+    RESET_SET;        // Начальное состояние
+    sleep(10000); 
+    RESET_RES;        // Опускаем в 0 (Сброс)
+    sleep(50000);     // Ждем (важно!)
+    RESET_SET;        // Поднимаем в 1 (Работа)
+    sleep(50000);     // Ждем выхода из сброса
+    
+    CS_SET;           // Отпускаем выбор чипа
+
+    // 4. Отправка команд
+    ssd1306SendCommand(0xAE); // display off
+    ssd1306SendCommand(0xD5); // Set Memory Addressing Mode
+    ssd1306SendCommand(0x80); // 00,Horizontal Addressing Mode;01,Vertical
+    ssd1306SendCommand(0xA8); // Set Page Start Address for Page Addressing
+    ssd1306SendCommand(0x3F); // Set COM Output Scan Direction
+    ssd1306SendCommand(0xD3); // set low column address
+    ssd1306SendCommand(0x00); // set high column address
+    ssd1306SendCommand(0x40); // set start line address
+    ssd1306SendCommand(0x8D); // set contrast control register
+    ssd1306SendCommand(0x14);
+    ssd1306SendCommand(0x20); // set segment re-map 0 to 127
+    ssd1306SendCommand(0x00); // set normal display
+    ssd1306SendCommand(0xA1); // set multiplex ratio(1 to 64)
+    ssd1306SendCommand(0xC8); //
+    ssd1306SendCommand(0xDA); // 0xa4,Output follows RAM
+    ssd1306SendCommand(0x12); // set display offset
+    ssd1306SendCommand(0x81); // not offset
+    ssd1306SendCommand(0x8F); // set display clock divide ratio/oscillator frequency
+    ssd1306SendCommand(0xD9); // set divide ratio
+    ssd1306SendCommand(0xF1); // set pre-charge period
+    ssd1306SendCommand(0xDB); 
+    ssd1306SendCommand(0x40); // set com pins hardware configuration
+    ssd1306SendCommand(0xA4);
+    ssd1306SendCommand(0xA6); // set vcomh
+    ssd1306SendCommand(0xAF); // 0x20,0.77xVcc
+}
+
+void ssd1306DrawPixel(uint16_t x, uint16_t y, COLOR color){
+    if ((x < SSD1306_WIDTH) && (y < SSD1306_HEIGHT) && (x >= 0) && (y >= 0))
+    {
+        uint16_t coord = x + (y / 8) * SSD1306_WIDTH;
+    	if (color == WHITE)
+      	{
+      	    displayBuff[coord] |= (1 << (y % 8));
+	}
+	else if (color == BLACK)
+	{
+	    displayBuff[coord] &= ~(1 << (y % 8));
+	}
+    }
+}
+
+void ssd1306FillDisplay(COLOR color)
+{
+    uint16_t i;
+    for(i = 0; i < SSD1306_HEIGHT * SSD1306_WIDTH; i++)
+    {
+        if(color == WHITE)
+            displayBuff[i] = 0xFF;
+	else if(color == BLACK)
+	    displayBuff[i]=0;
+    }
+}
+
+void updateAndSleep(uint32_t iterations) 
+{
+    ssd1306RunDisplayUPD();   // 1. Даем команду: «Отправить то, что нарисовали, на экран»
+    sleep(iterations);        // 2. Даем процессору команду: «Подожди немного»
+}
+
+void ssd1306SpiralStep(COLOR color, uint32_t delayTime) {
+    int top = 0;
+    int bottom = SSD1306_HEIGHT - 1;
+    int left = 0;
+    int right = SSD1306_WIDTH - 1;
+
+    while (left <= right && top <= bottom) {
+        // Вправо
+        for (int i = left; i <= right; i++) ssd1306DrawPixel(i, top, color);
+        top++;
+        updateAndSleep(delayTime);
+
+        // Вниз
+        for (int i = top; i <= bottom; i++) ssd1306DrawPixel(right, i, color);
+        right--;
+        updateAndSleep(delayTime);
+
+        // Влево
+        if (top <= bottom) {
+            for (int i = right; i >= left; i--) ssd1306DrawPixel(i, bottom, color);
+            bottom--;
+            updateAndSleep(delayTime);
+        }
+
+        // Вверх
+        if (left <= right) {
+            for (int i = bottom; i >= top; i--) ssd1306DrawPixel(left, i, color);
+            left++;
+            updateAndSleep(delayTime);
+        }
+    }
+}
+ать 
+        // с хвоста или с головы в зависимости от порядка.
+        ssd1306SpiralStep(BLACK, 1000);
+        // Пауза перед новым циклом
+        sleep(5000);
+    }
+    
+}
+
+
+
+
+#include "stm32f10x.h"
+#include "rcc.h"
+#include <stdlib.h>
+#include <stdint.h>
+//#include "EventRecorder.h"
+
+
+
+
+#ifndef __RCC
+#define __RCC
+#include "stm32f10x.h"
+
+int RccClockInit(void);
+
+
+#endif
+
+
+#include "rcc.h"
+
+int RccClockInit()
+{
+    // Enable HSE
+    // Setting PLL
+    // Enable PLL
+    // Setting count wait cycles of FLASH
+    // Setting AHB1,AHB2 prescaler
+    // Switch to PLL
+    
+    uint16_t timeDelay;
+    RCC->CR |= RCC_CR_HSEON;          // Запуск генератора
+    
+    for (timeDelay=0;;timeDelay++)    // Раскачка кварца (стабилизация процесса)
+    {
+    	if (RCC->CR & RCC_CR_HSERDY)  // Выход из цикла по завершении стабилизации HSE
+    	    break;
+    	if (timeDelay > 0x1000)
+    	{
+    	    RCC->CR &= ~RCC_CR_HSEON; // Отключение "стартера" по таймауту  (4096 итераций)
+    	    return 1;
+    	}
+    }
+    
+    RCC->CFGR |= RCC_CFGR_PLLMULL9;   // PLL x9
+    RCC->CFGR |= RCC_CFGR_PLLSRC;     // PLL source: HSE
+    RCC->CR |= RCC_CR_PLLON;          // Enable PLL
+    
+    for (timeDelay=0;;timeDelay++)    // Ожидание захвата подстроечной частоты
+    {
+    	if (RCC->CR & RCC_CR_PLLRDY)  // Реализовано на уровне флагов регистров
+    	    break;
+    	if (timeDelay > 0x1000)       // Отключение по таймауту (4096 итераций)
+    	{
+    	    RCC->CR &= ~RCC_CR_HSEON;
+    	    RCC->CR &= ~RCC_CR_PLLON;
+    	    return 2;
+    	}
+    }
+    
+    // Подготовка трассы (Flash и шины)
+    FLASH->ACR |= FLASH_ACR_LATENCY_2;    // Добавление двух тактов ожидания для предотвращения процессорных сбоев
+    RCC->CFGR |= RCC_CFGR_PPRE1_DIV2;     // APB1 prescaler=2 - Системная настройка, ловим каждый второй такт
+    
+    RCC->CFGR |= RCC_CFGR_SW_PLL;                       // Переключение ядра на PLL
+    while ((RCC->CFGR & RCC_CFGR_SWS) != (0x02<<2)) {}  // Ожидание подтверждения
+    RCC->CR &= ~RCC_CR_HSION;                           // Отключение внутреннего HSI за ненадобностью
+    
+    return 0;
+}
+
+
+#ifndef __SSD1306
+#define __SSD1306
+
+#include "stm32f10x.h"
+#include "stdlib.h"
+
+#define SSD1306_WIDTH 128
+#define SSD1306_HEIGHT 64
+#define BUFFER_SIZE 1024
+
+// Для PA8, PA9, PA10:
+#define CS_SET      GPIOA->BSRR = (1 << 9)   // PA9 в 1
+#define CS_RES      GPIOA->BSRR = (1 << 25)  // PA9 в 0 (9 + 16 = 25 бит для Reset)
+#define DATA        GPIOA->BSRR = (1 << 10)  // PA10 в 1
+#define COMMAND     GPIOA->BSRR = (1 << 26)  // PA10 в 0
+#define RESET_SET   GPIOA->BSRR = (1 << 8)   // PA8 в 1
+#define RESET_RES   GPIOA->BSRR = (1 << 24)  // PA8 в 0
+
+/*
+#define CS_SET GPIOA->BSRR|=GPIO_BSRR_BS2
+#define CS_RES GPIOA->BSRR|=GPIO_BSRR_BR2
+#define RESET_SET GPIOA->BSRR|=GPIO_BSRR_BS1
+#define RESET_RES GPIOA->BSRR|=GPIO_BSRR_BR1
+#define DATA GPIOA->BSRR|=GPIO_BSRR_BS3
+#define COMMAND GPIOA->BSRR|=GPIO_BSRR_BR3
+*/
+
+typedef enum COLOR
+{
+    BLACK,
+    WHITE
+} COLOR;
+
+void SPI1Init(void);
+void SPI1Transmit(uint8_t data);
+void ssd1306RunDisplayUPD(void);
+void ssd1306StopDispayUPD(void);
+void ssd1306SendCommand(uint8_t command);
+void ssd1306Init(void);
+void ssd1306DrawPixel(uint16_t x, uint16_t y,COLOR color);
+void ssd1306FillDisplay(COLOR color);
+
+void updateAndSleep(uint32_t iterations);
+void ssd1306SpiralStep(COLOR color, uint32_t delayTime);
+#endif
+
+
+
+#include "ssd1306.h"
+#include "sync.h"     // sleep(uint8_t iterations); // 577067 = 1 c
+
+static uint8_t displayBuff[BUFFER_SIZE];                       // Буфер экрана
+
+
+void SPI1Init()
+{
+    // 1. Включаем тактирование (добавили AFIO для стабильности альтернативных функций)
+    RCC->APB2ENR |= RCC_APB2ENR_SPI1EN | RCC_APB2ENR_IOPAEN | RCC_APB2ENR_AFIOEN;
+    RCC->AHBENR  |= RCC_AHBENR_DMA1EN;
+    
+    // 2. PA5-SCK, PA7-MOSI (Альтернативная функция Push-Pull)
+    // Очищаем MODE и CNF для пинов 5 и 7, затем ставим 1011 (AF Output PP, 50MHz)
+    GPIOA->CRL &= ~(GPIO_CRL_CNF5 | GPIO_CRL_MODE5 | GPIO_CRL_CNF7 | GPIO_CRL_MODE7);
+    GPIOA->CRL |= (GPIO_CRL_MODE5 | GPIO_CRL_CNF5_1); // AF PP 50MHz для SCK
+    GPIOA->CRL |= (GPIO_CRL_MODE7 | GPIO_CRL_CNF7_1); // AF PP 50MHz для MOSI
+    
+    // 3. PA8 (RES), PA9 (CS), PA10 (DC) (Обычный выход Push-Pull)
+    // Очищаем MODE и CNF, ставим 0011 (General Purpose Output PP, 50MHz)
+    GPIOA->CRH &= ~(GPIO_CRH_CNF8 | GPIO_CRH_MODE8 | 
+                    GPIO_CRH_CNF9 | GPIO_CRH_MODE9 | 
+                    GPIO_CRH_CNF10 | GPIO_CRH_MODE10);
+    GPIOA->CRH |= (GPIO_CRH_MODE8 | GPIO_CRH_MODE9 | GPIO_CRH_MODE10);
+    
+    // Сразу выставляем CS в 1, чтобы дисплей не начал принимать мусор при старте
+    GPIOA->BSRR = GPIO_BSRR_BS9; 
+
+    // 4. Настройка SPI1
+    SPI1->CR1 = 0; // Сброс регистра для чистой настройки
+    SPI1->CR1 |= (SPI_CR1_MSTR | SPI_CR1_SSI | SPI_CR1_SSM); 
+    
+    // Замедляем скорость до максимума (BR = 111) для теста. Если заработает - уменьшим.
+    // Частота будет: 72МГц / 256 = ~280кГц. Это гарантированно прочитает любой дисплей.
+    SPI1->CR1 |= (SPI_CR1_BR_2 | SPI_CR1_BR_1 | SPI_CR1_BR_0); 
+    
+    SPI1->CR2 |= SPI_CR2_TXDMAEN; 
+    SPI1->CR1 |= SPI_CR1_SPE; // Включаем SPI
+    sleep(5000);
+    
+    // 5. Настройка DMA1 Канал 3
+    DMA1_Channel3->CCR = 0; // Полный сброс настроек канала
+    DMA1_Channel3->CCR |= (DMA_CCR3_DIR |    // Направление: из памяти в периферию
+                           DMA_CCR3_MINC |   // Инкремент адреса памяти включен
+                           DMA_CCR3_PL_1 |   // Приоритет: Высокий (High)
+                           DMA_CCR3_TCIE);   // Прерывание по завершению передачи
+
+}
+
+void SPI1Transmit(uint8_t data)
+{
+    // Ждем, пока буфер передачи станет пустым
+    while(!(SPI1->SR & SPI_SR_TXE)); 
+    // Отправляем данные
+    SPI1->DR = data;
+    // Ждем, пока последний бит физически покинет ножку MOSI
+    while((SPI1->SR & SPI_SR_BSY));
+}
+
+
+void ssd1306RunDisplayUPD()
+{
+    DMA1_Channel3->CCR &= ~(DMA_CCR1_EN);         // Выключить DMA
+    DMA1_Channel3->CPAR = (uint32_t)(&SPI1->DR);  // Занесем в DMA адрес регистра данных SPI1
+    DMA1_Channel3->CMAR = (uint32_t)&displayBuff; // Адрес данных
+    DMA1_Channel3->CNDTR = sizeof(displayBuff);   // Размер данных
+    DMA1->IFCR &= ~(DMA_IFCR_CGIF3);
+    CS_RES;                                       // Выбор устройства на шине
+    DMA1_Channel3->CCR |= DMA_CCR1_CIRC;          // Циклический режим DMA
+    DMA1_Channel3->CCR |= DMA_CCR1_EN;            // Включить DMA
+}
+
+void ssd1306StopDispayUPD()
+{
+    CS_SET;                                       // Дезактивация устройства на шине
+    DMA1_Channel3->CCR &= ~(DMA_CCR1_EN);         // Выключить DMA
+    DMA1_Channel3->CCR &= ~DMA_CCR1_CIRC;         // Выключить циклический режим
+}
+
+void ssd1306SendCommand(uint8_t command) {
+    COMMAND;          // DC в 0
+    CS_RES;           // Выбрать чип
+    SPI1Transmit(command);
+    CS_SET;           // Отпустить чип
+}
+
+void ssd1306Init()
+{
+    uint16_t i;
+ 
+    // 1. Настройку GPIOA->CRL и GPIOA->CRH здесь не производим, 
+    // так как она уже сделана в SPI1Init() для пинов 8, 9, 10.
+
+    // 2. Очистка буфера в памяти МК
+    for(i = 0; i < BUFFER_SIZE; i++)
+    {
+        displayBuff[i] = 0;
+    }
+
+    // 3. Аппаратный сброс
+    RESET_SET;        // Начальное состояние
+    sleep(10000); 
+    RESET_RES;        // Опускаем в 0 (Сброс)
+    sleep(50000);     // Ждем (важно!)
+    RESET_SET;        // Поднимаем в 1 (Работа)
+    sleep(50000);     // Ждем выхода из сброса
+    
+    CS_SET;           // Отпускаем выбор чипа
+
+    // 4. Отправка команд
+    ssd1306SendCommand(0xAE); // display off
+    ssd1306SendCommand(0xD5); // Set Memory Addressing Mode
+    ssd1306SendCommand(0x80); // 00,Horizontal Addressing Mode;01,Vertical
+    ssd1306SendCommand(0xA8); // Set Page Start Address for Page Addressing
+    ssd1306SendCommand(0x3F); // Set COM Output Scan Direction
+    ssd1306SendCommand(0xD3); // set low column address
+    ssd1306SendCommand(0x00); // set high column address
+    ssd1306SendCommand(0x40); // set start line address
+    ssd1306SendCommand(0x8D); // set contrast control register
+    ssd1306SendCommand(0x14);
+    ssd1306SendCommand(0x20); // set segment re-map 0 to 127
+    ssd1306SendCommand(0x00); // set normal display
+    ssd1306SendCommand(0xA1); // set multiplex ratio(1 to 64)
+    ssd1306SendCommand(0xC8); //
+    ssd1306SendCommand(0xDA); // 0xa4,Output follows RAM
+    ssd1306SendCommand(0x12); // set display offset
+    ssd1306SendCommand(0x81); // not offset
+    ssd1306SendCommand(0x8F); // set display clock divide ratio/oscillator frequency
+    ssd1306SendCommand(0xD9); // set divide ratio
+    ssd1306SendCommand(0xF1); // set pre-charge period
+    ssd1306SendCommand(0xDB); 
+    ssd1306SendCommand(0x40); // set com pins hardware configuration
+    ssd1306SendCommand(0xA4);
+    ssd1306SendCommand(0xA6); // set vcomh
+    ssd1306SendCommand(0xAF); // 0x20,0.77xVcc
+}
+
+void ssd1306DrawPixel(uint16_t x, uint16_t y, COLOR color){
+    if ((x < SSD1306_WIDTH) && (y < SSD1306_HEIGHT) && (x >= 0) && (y >= 0))
+    {
+        uint16_t coord = x + (y / 8) * SSD1306_WIDTH;
+    	if (color == WHITE)
+      	{
+      	    displayBuff[coord] |= (1 << (y % 8));
+	}
+	else if (color == BLACK)
+	{
+	    displayBuff[coord] &= ~(1 << (y % 8));
+	}
+    }
+}
+
+void ssd1306FillDisplay(COLOR color)
+{
+    uint16_t i;
+    for(i = 0; i < SSD1306_HEIGHT * SSD1306_WIDTH; i++)
+    {
+        if(color == WHITE)
+            displayBuff[i] = 0xFF;
+	else if(color == BLACK)
+	    displayBuff[i]=0;
+    }
+}
+
+void updateAndSleep(uint32_t iterations) 
+{
+    ssd1306RunDisplayUPD();   // 1. Даем команду: «Отправить то, что нарисовали, на экран»
+    sleep(iterations);        // 2. Даем процессору команду: «Подожди немного»
+}
+
+void ssd1306SpiralStep(COLOR color, uint32_t delayTime) {
+    int top = 0;
+    int bottom = SSD1306_HEIGHT - 1;
+    int left = 0;
+    int right = SSD1306_WIDTH - 1;
+
+    while (left <= right && top <= bottom) {
+        // Вправо
+        for (int i = left; i <= right; i++) ssd1306DrawPixel(i, top, color);
+        top++;
+        updateAndSleep(delayTime);
+
+        // Вниз
+        for (int i = top; i <= bottom; i++) ssd1306DrawPixel(right, i, color);
+        right--;
+        updateAndSleep(delayTime);
+
+        // Влево
+        if (top <= bottom) {
+            for (int i = right; i >= left; i--) ssd1306DrawPixel(i, bottom, color);
+            bottom--;
+            updateAndSleep(delayTime);
+        }
+
+        // Вверх
+        if (left <= right) {
+            for (int i = bottom; i >= top; i--) ssd1306DrawPixel(left, i, color);
+            left++;
+            updateAndSleep(delayTime);
+        }
+    }
+}
+
